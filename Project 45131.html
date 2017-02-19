@@ -1,0 +1,947 @@
+﻿<!DOCTYPE html>
+
+
+<head>
+	<meta charset="utf-8"/>
+	<title>Project 45131</title>
+
+	<script src="webgl-fmi.js"></script>
+	
+	
+	<script id="vshader1" type="x-shader/x-vertex">
+		uniform float uAspectRatio;
+		
+		attribute vec2 aXY;
+		varying vec2 vXY;
+		
+		void main ()
+		{
+			gl_Position = vec4(aXY,0.0,1.0);
+			vXY = vec2(uAspectRatio,1.0)*aXY;
+		}
+	</script>
+	
+	<script id="fshader1" type="x-shader/x-fragment">
+		//ambient occlusion
+		#define AO
+		#define AO_STEPS 10
+		//soft shadows
+		#define SS
+		#define SS_STEPS 16
+		//sub-surface scattering
+		#define SSS
+		#define SSS_STEPS 5
+		//fog
+		#define FOG
+		//fresnel
+		#define FRESNEL
+		//iteration steps
+		#define MAX_STEPS 100
+		//znear and zfar
+		#define TMIN 0.1
+		#define TMAX 500.0
+		
+		precision mediump float;
+		
+		uniform highp float uGlobalTime;
+		uniform float uZFromFov;
+		uniform int uRenderingMode;
+		
+		//the camera
+		uniform vec3 uCameraPosition;
+		uniform mat3 uCameraMatrix;
+		
+		//the plahyer
+		uniform vec3 uPlayerPosition;
+		uniform mat3 uPlayerMatrix;
+		
+		//number of cubes
+		#define NUM_CUBES 9
+		//a uniform array to hold all cuboids(format is: pos0,size0,...,posn,sizen)
+		uniform vec3 uCubes[2*NUM_CUBES];
+		
+		varying vec2 vXY;
+		
+		
+		//precision
+		const float EPSILON = 0.001;
+		const float PI = 3.1415926535;
+		//a few colors
+		const vec3 boxColor = vec3 ( 245.0, 198.0, 35.0 ) /255.0;
+		const vec3 boxSSSColor = vec3 ( 34.0, 177.0, 76.0 ) /255.0;
+		const vec3 skyColor = vec3(0.7, 0.9, 1.0);
+		const vec3 mengerColor = vec3(0.85,0.85,0.95);
+		const vec3 donutColor = vec3(0.9,0.4,0.4);
+		///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+		//HELPER FUNCTIONS
+		///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+		//A hashing function (float,float)->float in [-1,1]
+		float hash21(vec2 pos)
+		{
+		  return fract(sin(dot(pos, vec2(12.9898, 78.233)))* 43758.5453);
+		}
+
+		//some distance functions:
+		mat2 rot(float r)
+		{
+			return mat2(cos(r),-sin(r),sin(r),cos(r));
+		}
+		
+		vec3 rotateX(in vec3 p, float rx)
+		{
+			return vec3(p.x, rot(rx)*p.yz);
+		}
+		
+		vec3 rotateY(in vec3 p, float ry)
+		{
+			return vec3(rot(ry)*p.xz,p.y).xzy;
+		}
+		
+		float sdSphere(in vec3 p, float r)
+		{
+			return length(p)-r;
+		}
+		
+		float sdPlane(in vec3 p)
+		{
+			return p.y;
+		}
+		
+		float sdBox( vec3 p, vec3 b )
+		{
+		  vec3 d = abs(p) - b;
+		  return min(max(d.x,max(d.y,d.z)),0.0) + length(max(d,0.0));
+		}
+		
+		float sdTorus( vec3 p, vec2 t )
+		{
+		  vec2 q = vec2(length(p.xz)-t.x,p.y);
+		  return length(q)-t.y;
+		}
+		
+		float mengerSponge( in vec3 p, in float size )
+		{
+		   float d = sdBox(p,vec3(size));
+
+		   float s = 1.0/size;
+		   for( int m=0; m<4; m++ )
+		   {
+			  vec3 a = mod( p*s, 2.0 )-1.0;
+			  s *= 3.0;
+			  vec3 r = abs(1.0 - 3.0*abs(a));
+
+			  float da = max(r.x,r.y);
+			  float db = max(r.y,r.z);
+			  float dc = max(r.z,r.x);
+			  float c = (min(da,min(db,dc))-1.0)/s;
+
+			  d = max(d,c);
+		   }
+
+		   return d;
+		}
+		
+		vec2 opU(in vec2 a, in vec2 b)
+		{
+			return (a.x<b.x)?a:b;
+		}
+		
+		float opS( float d1, float d2 )
+		{
+			return max(-d2,d1);
+		}
+		
+		float playerDistanceField(vec3 p)
+		{
+			return sdSphere(p-uPlayerPosition,5.0);
+		}
+		
+		
+		//////////////////////////////////////////////////////////
+		//CORE
+		/////////////////////////////////////////////////////////
+		
+		//the scene
+		vec2 map(in vec3 p)
+		{
+			//the ground
+			vec2 res = vec2(sdPlane(p),2.0);
+			//the player
+			res = opU(vec2(playerDistanceField(p),1.0),res);
+			
+			//res = opU(vec2(sdSphere(p-vec3(0.0,10.0,-20.0),5.0),1.0),res);
+			//the stairs
+			for(int i=0;i<NUM_CUBES;++i)
+			{
+				//p-uCubes[2*i] translates the cube to its position
+				res = opU(res, vec2(sdBox(p-uCubes[2*i],uCubes[2*i+1]),3.0));
+			}
+			//the planet
+			//res = opU(vec2(sdSphere(p-vec3(30.0,300.0,500.0),125.0)+ 10.0*sin(p.x/10.0)*sin(p.y/10.0)*sin(p.z/10.0),2.0),res); 
+			res = opU(vec2(sdSphere(p-vec3(30.0,300.0,500.0),125.0),3.0),res); 
+			
+			//a torus
+			res = opU(vec2(sdTorus(rotateX(p-vec3(80.0,60.0,30.0),-uGlobalTime/1.5),vec2(20.0,5.0)),5.0),res); 
+			
+			//menger sponge
+			res = opU(vec2(mengerSponge(rotateY(rotateX(p-vec3(-60.0,60.0,30.0), uGlobalTime), uGlobalTime/3.0), 20.0),4.0),res);
+			
+			return res;
+		}
+		
+		//normal from gradient
+		vec3 calcNormal(in vec3 p)
+		{
+			vec2 e1 = vec2(0.1,0.0);
+			//numerical differentiation with central difference
+			return normalize(vec3(map(p+e1.xyy).x-map(p-e1.xyy).x,
+			map(p+e1.yxy).x-map(p-e1.yxy).x,
+			map(p+e1.yyx).x-map(p-e1.yyx).x));
+		}
+		
+		//fake ambient occlusion, sample distance function by moving along the normal
+		float calcAO( in vec3 pos, in vec3 nor )
+		{
+			float occ = 0.0;
+			float sca = 0.004;
+			for( int i=0; i<AO_STEPS; i++ )
+			{
+				float hr = 0.01 + 15.0*float(i)/(float(AO_STEPS)-1.0);
+				vec3 aopos =  nor * hr + pos;
+				float dd = map( aopos ).x;
+				occ += -(dd-hr)*sca;
+				sca *= 0.95;
+			}
+			return clamp( 1.0 - 3.0*occ, 0.0, 1.0 );    
+		}
+		
+		//fake sub-surface scattering, sample distance function by moving along the ray
+		float calcSSS( in vec3 p, vec3 lookDirection)
+		{
+			float total = 0.0;
+			float weigth = 0.5;
+			
+			for ( int i = 0; i < SSS_STEPS; ++i )
+			{
+				float delta = pow ( float(i) +1.0, 2.5 ) *0.12;
+				total += -weigth *min( 0.0, map( p + lookDirection *delta).x );
+				weigth *= 0.5;
+			}
+			
+			return clamp(total,0.0,1.0);
+		}
+		
+		//fake soft shadows, sample distance function by moving along the ray direction
+		float softshadow( in vec3 ro, in vec3 rd, in float mint, in float tmax )
+		{
+			float res = 1.0;
+			float t = mint;
+			for( int i=0; i<SS_STEPS; i++ )
+			{
+				float h = map( ro + rd*t ).x;
+				res = min( res, 3.0*h/t );
+				t += clamp( h, mint, tmax );
+				if( h<0.01 || t>tmax ) break;
+			}
+			return clamp( res, 0.0, 1.0 );
+		}
+		
+		
+		//fog - with sun simulation
+		vec3 calcFog ( vec3 currentColor, vec3 ray, vec3 sunDirection )
+		{
+			float rayLength = length ( ray );
+			ray = ray /rayLength;
+			
+			float fogAmount = 1.0 -exp ( -rayLength *0.002 );
+			float sunAmount = pow ( max ( dot ( ray, sunDirection ), 0.0 ), 8.0 );
+			
+			vec3 fogColor = mix ( vec3 ( 0.5, 0.6, 0.7 ), vec3 ( 1.0, 0.9, 0.7 ), sunAmount );
+			return mix ( currentColor, fogColor, fogAmount );
+		}
+		
+		
+		vec3 castRay(in vec3 ro, in vec3 rd)
+		{
+			float prec = EPSILON;
+			float tmin = TMIN;
+			float tmax = TMAX;
+			float id = -1.0;
+			float t = tmin;
+			vec2 res;
+			int j=0;
+			for(int i=0;i<MAX_STEPS;++i)
+			{
+				res = map(ro+rd*t);
+				if(res.x<prec+t/tmax || t>tmax) break;
+				t+=res.x;
+				id = res.y;
+				++j;
+			}
+			if(t>tmax || j==MAX_STEPS) id = -1.0;
+			return vec3(t,id,float(j)/float(MAX_STEPS));
+		}
+		
+		//normal rendering mode
+		vec3 render(in vec3 ro, in vec3 rd)
+		{
+			//check ray intersection  with scene
+			vec3 res = castRay(ro,rd);
+			//directional light - sun:
+			vec3 lightDir = normalize(-vec3(-6.0*sin(uGlobalTime/10.0),-5.0,6.0*sin(uGlobalTime/5.0)));
+			
+			//if the ray didn't hit anything => it hit the sky
+			if(res.y==-1.0)
+				return skyColor+0.5*(1.0-skyColor)*(1.0+dot(rd,lightDir));
+			
+			//calculate the intersection point
+			vec3 p = ro+rd*res.x;
+			//diffuse term
+			vec3 diff = vec3(0);
+			//ambient term
+			vec3 amb = vec3(0.01,0.01,0.01);
+			//specular term
+			vec3 spec = vec3(1.0,1.0,1.0);
+			//Shinniness
+			float shin = 0.0;
+			//the normal
+			vec3 normal = vec3(0);
+			if(res.y==1.0)//the player's material
+			{
+				diff = vec3(hash21(floor(0.5+(p.xz-10.0)/20.0)),hash21(floor(0.5+(p.xx-10.0)/20.0)),hash21(floor(0.5+(p.zx-10.0)/20.0)));
+				//get the normal of the player				
+				normal = (p-uPlayerPosition)/5.0;	
+				shin=10.0*hash21(floor(0.5+(p.xz-10.0)/20.0));
+			}
+			else if(res.y==2.0)//the ground's material
+			{
+				float f = mod( floor(0.05*p.z) + floor(0.05*p.x), 2.0);
+				//diffuse term - chess floor
+				diff =  0.3 + 0.1*f*vec3(1.0);
+				
+				//normal
+				normal = vec3(0.0,1.0,0.0);
+				shin=3.0;
+				
+			}
+			else if(res.y==3.0)//material of the stairs
+			{
+				diff = boxColor;
+				normal = calcNormal(p);	
+				shin=3.0;
+				#ifdef SSS
+				float sssTerm = calcSSS(p, rd);
+				diff = mix ( diff, boxSSSColor, sssTerm );
+				#endif
+				//softShad = softshadow( p, lightDir, 1.0, 10.0 );
+			}
+			else if(res.y==4.0)//material for the menger sponge
+			{
+				diff = mengerColor;
+				normal = calcNormal(p);	
+				shin=0.0;
+			}
+			else if(res.y==5.0)//material for the torus sponge
+			{
+				diff = donutColor;
+				normal = calcNormal(p);	
+				shin=10.0;
+			}
+			
+			//Lambert's cosine term
+			vec3 intensity = vec3(clamp(dot(normal,lightDir),0.0,1.0));
+			//specular reflection
+			vec3 refl = reflect(lightDir,normal);
+			//specular intensity
+			vec3 specI = vec3(pow(clamp(dot(refl,rd),0.0,1.0),shin));
+			//Ambient occlusion factor
+			#ifdef AO
+			float occ = calcAO(p,normal);
+			#else
+			float occ = 1.0;
+			#endif
+			//soft shadows factos
+			#ifdef SS
+			float softShad = softshadow( p, lightDir, 1.0, 100.0 );
+			#else
+			float softShad = 1.0;
+			#endif
+			
+			#ifdef FRESNEL
+			//cheap fresnel approximation - Schlick
+			float fresnel = pow( clamp(1.0+dot(normal,rd),0.0,1.0), 2.0 );
+			#else
+			float fresnel = 1.0;
+			#endif
+			//phong reflection model
+			vec3 col = amb+(intensity*diff+specI*spec + fresnel*vec3(0.25))*occ*softShad;
+			//apply fog
+			#ifdef FOG
+			col = calcFog ( col, p - uCameraPosition, lightDir );
+			#endif
+			
+			return col;
+		}
+		
+		//Iteration based coloring rendering mode
+		vec3 render1(in vec3 ro, in vec3 rd)
+		{
+			vec3 res = castRay(ro,rd);
+			if(res.y>-1.0)
+			{
+				float b0 = 1.0/30.0;
+				float b1 = 0.25;
+				if(res.z<b0)
+				{
+					return vec3(min(1.0,res.z/b0)-0.8,min(res.z/b0,1.0)-0.8,sin(PI*res.z/b0));
+				}
+				else if(res.z<b1)
+				{
+					return vec3(min(1.0,res.z/b1)-0.6,sin(PI*res.z/b1),min(res.z/b1,1.0)-0.6);
+				}
+				else
+					return vec3(1.0-res.z,0.0,0.0);
+
+			}
+			else
+			{
+				return vec3(0.0,0.0,0.0);
+			}
+		}
+		
+		//AO rendering mode
+		vec3 render2(in vec3 ro, in vec3 rd)
+		{
+			vec3 res = castRay(ro,rd);
+			if(res.y>-1.0)
+			{
+				vec3 p =ro+rd*res.x;
+				vec3 normal = calcNormal(p);
+				float occ = calcAO(p,normal);
+				return occ*vec3(1.0,1.0,1.0);
+			}
+			else
+			{
+				return vec3(0.0,0.0,0.0);
+			}
+		}
+		
+		//Soft shadows rendering mode
+		vec3 render3(in vec3 ro, in vec3 rd)
+		{
+			vec3 res = castRay(ro,rd);
+			if(res.y>-1.0)
+			{
+				vec3 p =ro+rd*res.x;
+				vec3 lightDir = normalize(-vec3(-6.0*sin(uGlobalTime/10.0),-5.0,6.0*sin(uGlobalTime/5.0)));
+				vec3 normal = calcNormal(p);
+				float softShad = softshadow( p, lightDir, 1.0, 100.0 );
+				return softShad*vec3(1.0,1.0,1.0);
+			}
+			else
+			{
+				return vec3(0.0,0.0,0.0);
+			}
+		}
+		
+		void main( )
+		{
+			//get the current time
+			float time = uGlobalTime;
+			//ray origin
+			vec3 ro = uCameraPosition;
+			//ray direction
+			vec3 rd = normalize(uCameraMatrix*vec3(vXY, uZFromFov));  
+			//calculate pixel color:
+			vec3 col;
+			if(uRenderingMode==0)
+				col = render(ro,rd);
+			else if(uRenderingMode==1)
+				col = render1(ro,rd);
+			else if(uRenderingMode==2)
+				col = render2(ro,rd);
+			else
+				col = render3(ro,rd);
+			
+			//clamp
+			col = clamp(col,0.0,1.0);
+			//gamma correction
+			col = pow( col, vec3(0.4545) );
+			gl_FragColor = vec4(col,1.0);
+		}
+	</script>
+	<script>
+		//FEATURES:
+		//Interactivity:
+		//-W/S for forward/backward propulsion
+		//-A/D for left/right propulsion
+		//-up/down arrow for up/down rotation
+		//-left/right arrow for left/right rotation
+		//-space for jumping
+		//-q for rendering mode iteration
+		//Physics:
+		//-force based movement
+		//-inertia
+		//-quadratic drag
+		//-explicit euler integration
+		//-gravity
+		//-collisions - result in sliding
+		//-moving stairs
+		//-jumping - along the normal of the current surface
+		//Graphics:
+		//-raymarching based - "Sphere tracing: a geometric method for the antialiased raytracing of implicit surfaces" - John C. Hart
+		//-rendering modes: normal, ray iteration count, AO, soft shadows
+		//-fake ambient occlusion
+		//-fake sub-surface scattering
+		//-fake soft shadows
+		//-fake sky and sun
+		//-phong illumination model
+		//-directional light
+		//-chess floor
+		//-player color depends on position
+		//-realistic(exponential) fog simulation
+		//Misc:
+		//-3rd person camera
+		//-field of view based on velocity and camera orientation
+		//-menger sponge
+		
+		//field of view
+		midFov = PI/4;
+		maxFov = PI/2.5;
+		minFov = 2*midFov-maxFov;
+		fovEffectPercent = 1/3;
+		//current rendering mode
+		renderingMode = 0;
+		//planet
+		planetPos = [30,300,500];
+		planetGravityRange = 60;
+		
+		//player acceleration
+		inverse_mass = 1;
+		maxSpeed = 30;
+		dragCoef = 0.1;
+		//maxSpeed*maxSpeed*dragCoefficient = acc
+		acc = maxSpeed*maxSpeed*dragCoef;
+		gravity = [0,0,0];
+		forceJump = 100*acc/inverse_mass;
+		forceForward = acc/inverse_mass; forceBackward = forceForward;
+		forceLeft = acc/inverse_mass; forceRight = forceLeft;
+		accTurnLeft = 2; accTurnRight = accTurnLeft;
+		accTurnUp = 2; accTurnDown = accTurnUp;
+		speed = 0;
+		velocity = [0,0,0];
+		playerRadius = 5;
+		currentFov = midFov;
+		
+		//the distance field used for collisions(mimics the one used for graphics, but without the player)
+		function sdSphere(p,r)
+		{
+			return Vector3Length(p)-r;
+		}
+		
+		function sdPlane(p)
+		{
+			return p[1];
+		}
+		
+		function sdBox(p,b)
+		{
+		  var d = AddVectors3(AbsVector3(p), NegateVector3(b));
+		  return Math.min(Math.max(d[0],Math.max(d[1],d[2])),0.0) + Vector3Length(MaxVector3(d,[0,0,0]));
+		}
+				
+		function opU(a,b)
+		{
+			return (a[0]<b[0])?a:b;
+		}
+		
+		function opS(d1,d2)
+		{
+			return Math.max(-d2,d1);
+		}
+		
+		function start( )
+		{
+			var	canvas = document.getElementById("picasso");
+			canvas.addEventListener('webglcontextlost',function(event){event.preventDefault();},false);
+			canvas.addEventListener('webglcontextrestored',function(){init();},false);
+			width = canvas.width;
+			height = canvas.height;
+			heading = document.getElementById("heading");
+			info = document.getElementById("info");
+			document.body.addEventListener('keydown',keyDown,false);
+			document.body.addEventListener('keyup',keyUp,false);
+			
+			init();
+			drawFrame();
+		}
+		
+		// превключва на друга програма
+		function switchProgram(prog)
+		{
+			// правим желатана програма активна
+			glprog = prog; 
+			gl.useProgram(glprog);
+			getVariables();
+		}
+		
+		function init()
+		{
+			gl = getContext("picasso");
+			
+			//all shaders
+			glShader1 = getProgram("vshader1","fshader1");
+			
+			switchProgram(glShader1)
+			
+			
+			
+			//create the quad that we'll draw on
+			qd = new Quad();
+			//create the player
+			player = new Player([0.0,10.0,-20]);
+			//create the camera
+			camera = new Camera([0,10,-30]);
+			//assign the camera as a child to this pivot
+			player.pivot.addChild(camera.pivot);
+			//update the player's position
+			player.updatePosition();
+			//update the camera
+			camera.update();
+			
+			
+			//shader init
+			//set the aspect ratio
+			gl.uniform1f(uAspectRatio,width/height);
+			//set the field of view
+			gl.uniform1f(uZFromFov,ZFromFov(midFov,width/height));
+			//set the rendering mode
+			gl.uniform1i(uRenderingMode,renderingMode);
+				
+			
+			//MORE GEOMETRY
+			var cubesSizeTempl = [10.0,100.0,10.0];
+			cubesSize = [[10,0,10]];
+			cubes = [];
+			for(var i=0;i<9;++i)
+			{
+				cubesSize[i+1] = [cubesSizeTempl[0], (i+1)/9*cubesSizeTempl[1], cubesSizeTempl[2]];
+				cubes[i] = new GeometryObject([30,5,30+40*i],cubesSize[i+1]);
+			}
+			
+			cubesShader=[];
+			for(var i=0;i<cubes.length;++i)
+			{
+				cubesShader.push(cubes[i].pos[0],cubes[i].pos[1],cubes[i].pos[2], cubes[i].size[0],cubes[i].size[1],cubes[i].size[2]);
+			}
+			uCubes = gl.getUniformLocation(glprog,"uCubes");
+			gl.uniform3fv(uCubes, new Float32Array(cubesShader));
+			
+		}
+		
+		function distanceFun(p)
+		{
+			var res = [sdPlane(p),2.0];
+			res = opU([sdSphere([p[0],p[1]-10,p[2]],5.0),1.0],res);
+			for(var i=0;i<cubes.length;++i)
+			{
+				//p-uCubes[2*i] translates the cube to its position
+				res = opU(res, [sdBox(AddVectors3(p,NegateVector3(cubes[i].pos)),cubes[i].size),2.0]);
+			}
+			res = opU([sdSphere(AddVectors3(p,NegateVector3(planetPos)),125.0),4.0],res);
+			return res;
+		}
+		
+		function distanceFunNormal(p)
+		{
+			//numerical differentiation with central difference
+			return NormalizeVector3([distanceFun([p[0]+0.1,p[1],p[2]])[0]-distanceFun([p[0]-0.1,p[1],p[2]])[0],
+			distanceFun([p[0],p[1]+0.1,p[2]])[0]-distanceFun([p[0],p[1]-0.1,p[2]])[0],
+			distanceFun([p[0],p[1],p[2]+0.1])[0]-distanceFun([p[0],p[1],p[2]-0.1])[0]]);
+		}
+		
+		function gravityFunction(p)
+		{
+			distanceFunctionSample = distanceFun(p);
+			if(distanceFunctionSample[1]==4.0 && distanceFunctionSample[0]<planetGravityRange)
+			{
+				gravity = MultiplyVector3(-acc,NormalizeVector3(distanceFunNormal(p)));
+			}
+			else
+			{
+				gravity = [0,-acc,0];
+			}
+		}
+		
+		function updateMovement()
+		{
+			gravityFunction(player.pivot.pos);
+			//the differential equation for the velocity with quadratic drag is v(t)' = (a-cv^2(t))/mass
+			//it is solved with Euler's explicit method, producing:
+			//v(t+dt) = v(t)+acceleration*orientation*delta_time/mass - drag_coefficient*delta_time*v^2(t)/mass
+			//drag_velocity modification
+			var velocityModification = MultiplyVector3(dragCoef*inverse_mass*Vector3Length(velocity)*dt,NegateVector3(velocity));
+			velocityModification = AddVectors3(velocityModification, MultiplyVector3(dt,gravity));
+			if(kForward) 
+			{
+				//acceleration*orientation*delta_time/mass
+				velocityModification = AddVectors3(velocityModification,MultiplyVector3(dt*forceForward*inverse_mass,player.pivot.forwardVector()));
+			}
+			if(kBackward)
+			{
+				velocityModification = AddVectors3(velocityModification,MultiplyVector3(-dt*forceBackward*inverse_mass,player.pivot.forwardVector()));
+			}
+			if(kStrafeLeft)
+			{
+				velocityModification = AddVectors3(velocityModification,MultiplyVector3(-dt*forceLeft*inverse_mass,player.pivot.sideVector()));
+			}
+			if(kStrafeRight)
+			{
+				velocityModification = AddVectors3(velocityModification,MultiplyVector3(dt*forceRight*inverse_mass,player.pivot.sideVector()));
+			}
+			
+			var turn = false;
+			if(kTurnUp) 
+			{
+				player.pivot.turn([accTurnUp*dt,0,0]);
+				turn = true;
+			}
+			if(kTurnDown)
+			{
+				player.pivot.turn([-accTurnDown*dt,0,0]);
+				turn = true;
+			}
+			if(kTurnLeft)
+			{
+				player.pivot.turn([0,accTurnLeft*dt,0]);
+				turn = true;
+			}
+			if(kTurnRight)
+			{
+				player.pivot.turn([0,-accTurnRight*dt,0]);
+				turn = true;
+			}
+			
+			//if there's some change to the velocity
+			if(!IsZeroVector3(velocityModification))
+			{	
+				//modify the velocity
+				velocity = AddVectors3(velocity, velocityModification);
+				
+				//distance from the closest object
+				var df = distanceFun(player.pivot.pos)[0];
+				//if a collision occurs
+				if(df<playerRadius)
+				{
+					var collisionNormal = distanceFunNormal(player.pivot.pos);
+					//if the player went inside of an object - get him out
+					player.pivot.translate(MultiplyVector3(playerRadius-df+EPSILON,collisionNormal));
+					//are we trying to jump
+					if(kJump)
+					{
+						velocity = AddVectors3(velocity, MultiplyVector3(dt*inverse_mass*forceJump,collisionNormal));
+					}
+					var scalarProductNormalVelocity = ScalarProduct3(collisionNormal, velocity);
+					//change the velocity only if it's towards the object we're colliding with
+					if(scalarProductNormalVelocity<0)
+					{
+						//velocity = the projection of the velocity on the plane perpendicular to the normal
+						velocity = AddVectors3(velocity, MultiplyVector3(-scalarProductNormalVelocity,collisionNormal));
+					}
+				}
+				player.pivot.translate(MultiplyVector3(dt, velocity));
+				
+			}
+			//if the object is moving
+			if(!IsZeroVector3(velocity))
+			{
+				//calculate the velocity magnitude
+				speed = Vector3Length(velocity);
+				//update the speed output
+				info.innerHTML = "speed: "+Math.round(100*speed)/100;
+				player.pivot.translate(MultiplyVector3(dt, velocity));
+				//update the fov
+				if(!turn)
+				{
+					//mix coefficient clamped to [0,1]
+					var speedInDirectionFovCoef = ScalarProduct3(velocity, player.pivot.forwardVector())/maxSpeed;
+					speedInDirectionFovCoef *= speedInDirectionFovCoef;
+					//if(Math.abs(speedInDirectionFovCoef)<fovEffectPercent)
+						//speedInDirectionFovCoef = 0;
+					var mixCoef = Math.min(1,Math.max(0,0.5+0.5*speedInDirectionFovCoef));
+					currentFov = currentFov*0.8+0.2*(minFov*(1-mixCoef) + mixCoef*maxFov);
+					gl.uniform1f(uZFromFov,ZFromFov(currentFov,width/height));
+				}
+				//update the camera's position in the shader
+				player.updatePosition();
+				camera.updatePosition();
+			}
+			if(turn)
+			{
+				//update the fov
+				var speedInDirectionFovCoef = ScalarProduct3(velocity, player.pivot.forwardVector())/maxSpeed;
+				speedInDirectionFovCoef *= speedInDirectionFovCoef;
+				//if(Math.abs(speedInDirectionFovCoef)<fovEffectPercent)
+						//speedInDirectionFovCoef = 0;
+				var mixCoef = Math.min(1,Math.max(0,0.5+0.5*speedInDirectionFovCoef));
+				currentFov = currentFov*0.8+0.2*(minFov*(1-mixCoef) + mixCoef*maxFov);
+				gl.uniform1f(uZFromFov,ZFromFov(currentFov,width/height));
+				//update the camera's orientation in the shader
+				camera.updateMatrix();
+			}
+		}
+		
+		function updateCubes()
+		{
+			//update cubes
+			cubesShader.length=0;
+			for(var i=0;i<cubes.length;++i)
+			{
+				cubes[i].size[1] = cubesSize[i][1]/2 + 0.5*(cubesSize[i+1][1]-cubesSize[i][1]/2)*(1+Math.sin(time + i*PI/4));
+				cubes[i].pos[1] = cubes[i].size[1];
+				cubesShader.push(cubes[i].pos[0],cubes[i].pos[1],cubes[i].pos[2], cubes[i].size[0],cubes[i].size[1],cubes[i].size[2]);
+			}
+			gl.uniform3fv(uCubes, new Float32Array(cubesShader));
+		}
+		
+		var frame = 0;
+		var firstTime = (new Date()).getTime();
+		var oldTime = ((new Date()).getTime()-firstTime)/1000.0;
+		var time;
+		var fps;
+		var fpsTimeStamp = ((new Date()).getTime()-firstTime)/1000.0;
+		var fpsFrameStamp = 0;
+		var fpsUpdateRate = 1;
+		function drawFrame()
+		{
+			//frames and time
+			frame++;
+			time = ((new Date()).getTime()-firstTime)/1000.0;
+			if(time-fpsTimeStamp>fpsUpdateRate)
+			{
+				fps = (frame-fpsFrameStamp)/(time-fpsTimeStamp);
+				fpsFrameStamp = frame;
+				fpsTimeStamp = time;
+				heading.innerHTML = "Project 45131, fps: "+Math.round(fps);
+			}	
+			dt = (time-oldTime);
+			oldTime = time;
+			
+			
+			updateCubes();
+			updateMovement();
+			
+			gl.uniform1f(uGlobalTime,time);
+			qd.draw();
+			requestAnimationFrame(drawFrame);
+		}
+		
+		//keys
+		kForward = false; kBackward = false; 
+		kStrafeLeft = false; kStrafeRight = false;
+		kTurnUp = false; kTurnDown = false;
+		kTurnLeft = false; kTurnRight = false;
+		kJump = false;
+		function keyDown(e) 
+		{
+			e = e || window.event;
+			if (e.keyCode == '87') {
+				// W
+				kForward = true; kBackward = false;				
+			}
+			if (e.keyCode == '83') {
+				// S
+				kForward = false; kBackward = true;
+			}
+			if (e.keyCode == '65') {
+				// A
+				kStrafeLeft = true; kStrafeRight = false;
+			}
+			if (e.keyCode == '68') {
+				// D
+				kStrafeLeft = false; kStrafeRight = true;
+			}
+			if (e.keyCode == '38') {
+				// up arrow
+				kTurnUp = true; kTurnDown = false;
+			}
+			if (e.keyCode == '40') {
+				// down arrow
+				kTurnUp = false; kTurnDown = true;
+			}
+			if (e.keyCode == '37') {
+			   // left arrow
+			   kTurnLeft = true; kTurnRight = false;
+			}
+			if (e.keyCode == '39') {
+			   // right arrow
+			   kTurnLeft = false; kTurnRight = true;
+			}if (e.keyCode == '81') {
+			   // q
+			    renderingMode = (renderingMode+1)%4;
+				gl.uniform1i(uRenderingMode,renderingMode);
+			}
+			if (e.keyCode == '32') {
+			   // space
+			   kJump = true;
+			}
+			
+		}
+		
+		function keyUp(e) 
+		{
+			e = e || window.event;
+			if (e.keyCode == '87') {
+				// W
+				kForward = false;
+			}
+			if (e.keyCode == '83') {
+				// S
+				kBackward = false;
+			}
+			if (e.keyCode == '65') {
+				// A
+				kStrafeLeft = false;
+			}
+			if (e.keyCode == '68') {
+				// D
+				kStrafeRight = false;
+			}
+			if (e.keyCode == '38') {
+				// up arrow
+				kTurnUp = false;
+			}
+			if (e.keyCode == '40') {
+				// down arrow
+				kTurnDown = false;
+			}
+			if (e.keyCode == '37') {
+			   // left arrow
+			   kTurnLeft = false;
+			}
+			if (e.keyCode == '39') {
+			   // right arrow
+			   kTurnRight = false;
+			}
+			if (e.keyCode == '32') {
+			   // space
+			   kJump = false;
+			}
+		}
+	
+           
+		
+	</script>	
+</head>
+
+<body onload="start()">
+	<h2 id="heading">Project 45131</h2>
+	<h2 id="info"></h2>
+	<noscript>
+		Искаме JavaScript, но няма!
+	</noscript>
+	
+	<canvas id="picasso" width="600" height="400" style="border: solid;">
+		Искаме canvas, но няма!
+	</canvas>
+</body>
